@@ -27,9 +27,12 @@ link:
 
 
 run: 
-	./$(BIN)
+	./$(BIN) #-d
 
 gdb:
 	gdb -tui $(BIN)
+
+launch:
+	. ./launcher.sh
 
 #Hello World
