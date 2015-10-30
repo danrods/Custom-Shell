@@ -4,10 +4,10 @@ SpecialFlags = -DDEBUGFLAG
 BIN = 320sh
 SRC = $(wildcard *.c)
 OFILE = $(wildcard *.o)
+# ShellFlags = -d
 
 
-
-all: boilerPlate run
+all: boilerPlate launch
 
 boilerPlate: clean 320sh link
 
@@ -27,12 +27,10 @@ link:
 
 
 run: 
-	./$(BIN) #-d
+	./$(BIN) $(ShellFlags)
 
 gdb:
 	gdb -tui $(BIN)
 
 launch:
-	. ./launcher.sh
-
-#Hello World
+	.	./launcher.sh $(ShellFlags)
