@@ -1,6 +1,7 @@
 #include "320sh.h"
 
 
+
 #ifdef DEBUGFLAG
     VERBOSE_LEVEL DEBUG = DEV;
 #else 
@@ -14,12 +15,16 @@
 bool STDERR = false;
 bool isBatchMode = false;
 char pathVal[MAX_PATH];
-procP head = NULL;
+procP headProcess = NULL;
 procP foregroundProcess = NULL;
+int currentJobId = 0;
+histListP historyHead = NULL; 
+histListP lastKnownhistListPSpot = NULL;
 const char *prompt = "320sh> ";
-const char *builtInMethods[Total_BuiltIns] = {"pwd","echo","exit", "set", "history", "clear-history", "jobs", "fg", "bg", "kill"};
-
-
+const char* soloBuiltInMethods[Total_solo_builtin] = {"cd", "kill", "bg", "fg", "exit", "jobs","set","clear-history"};
+const char *builtInMethods[Total_BuiltIns] = {"pwd","echo", "history"};
+const char* STATUS[] = {"Running", "Stopped", "Killed", "Done"};
+volatile sig_atomic_t flag = 0;
 
 /*int argc, char ** argv, char **envp*/
 /*envp = array of strings of the form key=value*/
@@ -30,9 +35,13 @@ int main (int argc, char ** argv, char **envp) {
   int batch_index;
   memset(pathVal, 0, MAX_PATH);
   strcat(pathVal, prompt);
-  // signal (SIGTTIN, SIG_IGN);
-
   
+    struct sigaction new_action;
+    new_action.sa_handler = &signal_interrupt;
+    sigaction(SIGINT,&new_action,NULL);
+      // signal(SIGINT,signal_interrupt);
+      // signal(SIGTSTP,signal_pause);
+
     //int index = getPrintVarIndex(envp, key);
     bool nothing;
     if(envp == envp + 1){
@@ -40,17 +49,23 @@ int main (int argc, char ** argv, char **envp) {
     }
 
     batch_index = parse_options(argc, argv);
-  
+    readHistory();
+    // char buffer[MAX_INPT];
+    // char *cwd = getcwd(buffer,MAX_INPT);
+    //  BuildTrie(cwd);
 
   while (!finished) {
 
     
-    int rv;
+    int rv = 1;
     
     //printEnv(envp);
     
     // Print the prompt
-    rv = write(1, pathVal, strlen(pathVal)); /*Writes to STDOUT*/
+    if(! foregroundProcess){
+        rv = Write(1, pathVal, strlen(pathVal)); /*Writes to STDOUT*/
+    }
+    
     if (!rv) { 
       finished = 1;
       break;
@@ -66,7 +81,6 @@ int main (int argc, char ** argv, char **envp) {
       cmdP executable = (cmdP) calloc(1, sizeof(Command));
       executable = readCommand_stdin(rv, executable);
       executeAndFree(executable);
-      
     }
       
       
@@ -85,6 +99,13 @@ int main (int argc, char ** argv, char **envp) {
     
   }//End While(!finished)
 
+  /*************************************/
+  /*          FREE DATA SECTION        */
+  /*************************************/
+
+  //freeHistory();
+
+
 
 
   return exitCode;
@@ -93,8 +114,11 @@ int main (int argc, char ** argv, char **envp) {
 void executeAndFree(cmdP executable){  
     if(! executable) return; // If Executable is null, we're done 
     launchExecutable(executable);
-    free(executable->tacks[0]);
-    free(executable);
+    if(executable->isInfinite)
+      printProcess(foregroundProcess);
+    
+    //free(executable->tacks[0]);
+    //free(executable);
 
 }
 
@@ -208,12 +232,21 @@ cmdP readCommand(int rv, cmdP exec, char* buffer){
        
     }
 
-    if(count < 0) return NULL;
-    
-    parseBuffer(inputBuf, exec, count);
-    //writeHistory(exec); //TODO Fix History
-    replaceVariables(exec); //TODO : Fix replace Variables to accept multiple Commands
-    glob(exec); //TODO : Fix Glob to accept multiple Commands
+    if(count > 0) {
+        if(count == 1 && inputBuf[0] == '\n') return NULL; //Ignore empty lines
+
+        char* val = calloc(1 ,count + 1);//One for null terminator
+        strncpy(val, inputBuf, count + 1);
+        exec->originalStr = val;
+
+        parseBuffer(inputBuf, exec, count);
+        writeHistory(exec);
+        replaceVariables(exec); //TODO : Fix replace Variables to accept multiple Commands
+        glob(exec); //TODO : Fix Glob to accept multiple Commands
+    }
+    else{
+        return NULL;
+    }
 
     return exec;
 }
@@ -230,9 +263,32 @@ cmdP readCommand_stdin(int rv, cmdP exec){
 cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
    
     char* cursor;
-    int counter = 0;
+    //int counter = 0;
     const char* delim = " ";
-    
+    char * needle = "&";
+
+ /***************Step 0 : Check for Ampersands ****************/
+    char* ampersand;
+    bool isEnd = true;
+    if((ampersand = strstr(inputBuf, needle)) ){ //Theres an ampersand
+        char* start = ampersand;
+        int counter = 0;
+        for(start++; *start != '\0';start++){
+            if(*start != ' '){
+              counter++;
+              isEnd = false;
+            } 
+        }
+        if(isEnd){
+          debug("Yayy it's infinite\n");
+          exec->isInfinite = true;
+          for(;*ampersand !='\0'; ampersand++){
+            *(ampersand) ='\0';
+          }
+        }
+
+        
+    }
 
     /***********Step 1 : Check for Pipes **************/
     int totalPipes;
@@ -241,21 +297,19 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
 
       int i=0;
       cmdP head = parseBuffer(sections[i++], exec, count);
-      printCommand(head);
+      //printCommand(head);
       cmdP current = head;
       for(;i<(totalPipes + 1);i++){ //There should be one more than the amount of pipes we found
           cmdP newPtr = calloc(1, sizeof(Command));
           newPtr = parseBuffer(sections[i], newPtr, count);
           current->next=newPtr;
-          printCommand(newPtr);
+          //printCommand(newPtr);
           current = newPtr;
       }
 
       return exec; //Already got what I needed just return
     }//End Check for piped input
     /****************End Step 1 *************************/
-
-
 
 
     /************Step 2 : Check for Redirection**********/
@@ -265,7 +319,7 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
     //const char * original = "Hello > World < outtie";
 
     char* lt=NULL, *gt=NULL;
-    lt=strstr(inputBuf, LT);
+    lt=strstr(inputBuf, LT);//TODO : check if multiple
     gt=strstr(inputBuf, GT);
 
     bool failure = false;
@@ -275,7 +329,14 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
       *gt='\0';
           
       while(*(++lt) == ' ');
+      int length = strlen(lt);
+      char* end = lt + length;
+      while(*(--end) == ' ') *end ='\0';
+
       while(*(++gt) == ' ');
+      length = strlen(gt);
+      end = gt + length;
+      while(*(--end) == ' ') *end ='\0';
       
       input_fd = OpenFileCurrentDirIgnoreMode(lt, O_RDONLY);
       output_fd = OpenFileCurrentDir(gt, O_CREAT|O_TRUNC|O_WRONLY|O_APPEND, (S_IWUSR| S_IRUSR | S_IXUSR));
@@ -286,6 +347,11 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
      if(lt != NULL){
           *lt='\0';
           while(*(++lt) == ' ');
+
+          int length = strlen(lt);
+          char* end = lt + length;
+          while(*(--end) == ' ') *end ='\0';
+
           input_fd = OpenFileCurrentDirIgnoreMode(lt, O_RDONLY);
           if(input_fd < 0) failure = true;
           
@@ -293,6 +359,11 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
       else{
           *gt='\0';
           while(*(++gt) == ' ');
+
+          int length = strlen(gt);
+          char* end = gt + length;
+          while(*(--end) == ' ') *end ='\0';
+
           output_fd = OpenFileCurrentDir(gt, O_CREAT|O_TRUNC|O_WRONLY|O_APPEND, (S_IWUSR| S_IRUSR | S_IXUSR));
           if(output_fd < 0) failure = true;
 
@@ -302,7 +373,7 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
 
     exec->in_fd = input_fd;
     exec->out_fd = output_fd;
-    multiThreadDebug("InputFD --> %s(%d)\n OutputFD --> %s(%d)",lt,input_fd,gt,output_fd);
+    //multiThreadDebug("InputFD --> %s(%d)\n OutputFD --> %s(%d)\n",lt,input_fd,gt,output_fd);
 
 
     if(failure){
@@ -319,7 +390,11 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
 
     /****************Step 3 : Proceed normally***********/
     char * token = strtok((cursor=inputBuf), delim);
-    debug("Tokenized the input : %s\n", token);
+    //debug("Tokenized the input : %s\n", token);
+
+    //check to see if program has ./
+    char buffer[MAX_PATH];
+    char *cwd;
 
     if(token == NULL) {
       exec->valid = false;
@@ -327,7 +402,22 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
     }
     else 
     {
-      strncpy((exec->program), token, ((size_t)MAX_INPT/2)); //Copys the program token into the struct
+
+      if(strstr(token,HOMEPROGRAM) !=NULL)
+      {
+        cwd = getcwd(buffer,MAX_PATH);
+        char *newToken = calloc(1,strlen(cwd) + strlen((cursor +1)) + 1);
+
+        strcat(newToken,cwd);
+        strcat(newToken,(cursor+1));
+
+        strncpy(exec->program,newToken,((size_t)MAX_INPT/2));
+      }
+      else
+      {
+        strncpy((exec->program), token, ((size_t)MAX_INPT/2)); //Copys the program token into the struct
+      }
+
       *(exec->tacks) = token; //Copies the program into the argv array
       exec->valid = true;
       exec->tackCount = 1;
@@ -337,7 +427,7 @@ cmdP parseBuffer(char* inputBuf, cmdP exec, int count){
     argv++; /*Skip the first line because we've added the program name*/
 
     while((token = strtok(NULL, delim))){ 
-      debug("Tokenized the input : %s\n", token);
+      //debug("Tokenized the input : %s\n", token);
         *(argv++) = token;
         (exec->tackCount)++;
     }
@@ -357,7 +447,7 @@ char** parsePipes(int totalMatches, char* inputBuf){
 
 
     char * token = strtok((cursor=inputBuf), delim);
-    debug("Parsed Section : %s\n", token);
+    //debug("Parsed Section : %s\n", token);
 
     if(token == NULL) {
       return NULL;
@@ -367,7 +457,7 @@ char** parsePipes(int totalMatches, char* inputBuf){
         int i = 0;
         totalArgs[i++] = token;
         while((token = strtok(NULL, delim))){ //Keep looping until NULL
-          debug("Parsed Section : %s\n", token);
+          //debug("Parsed Section : %s\n", token);
             totalArgs[i++] = token;
         }
     }
@@ -386,6 +476,7 @@ int ReadBuffer(int rv,char inputBuf[]) {
       char last_char;
       bool printToScreen;
       char symbol;
+      char *strFromHist;
 
        for(rv = 1, count = 0, cursor = inputBuf, last_char = 1;
           // rv && (++count < (MAX_INPT-1))
@@ -400,14 +491,28 @@ int ReadBuffer(int rv,char inputBuf[]) {
 
             switch(symbol)
             {
+              case EOF:
+                return -1;
+                break;
               case CTRLC://ctrl+c
-                if(foregroundProcess) 
-                  signalGroupPid(foregroundProcess->pId,SIGINT);
+                if(foregroundProcess) {
+                   //errno=0;
+                   multiThreadDebug("Signaling Foreground to die : %d -->\n", foregroundProcess->pId);
+                   foregroundProcess->lastKnownStatus=2;
+                   signalChild(foregroundProcess->pId,SIG_INT);
+                   multiThreadDebug("DONE : child died successfully \n");
+                   //debug("Returning Errno : %s", strerror(errno));
+                 }
                 eraseLine();
                 return -1; //Ignore everything, we outtie
               case CTRLZ: // ctrl + z
-                if(foregroundProcess) 
-                  signalGroupPid(foregroundProcess->pId,SIGTSTP);
+                if(foregroundProcess){ 
+                    //errno=0;
+                    multiThreadDebug("Signaling Foreground to pause : %d -->\n", foregroundProcess->pId);
+                    foregroundProcess->lastKnownStatus=1;
+                    signalGroupPid(foregroundProcess->pId,SIG_TSTP);
+                    multiThreadDebug("DONE : child paused successfully \n");
+                }
                 eraseLine();
                 return -1; //Ignore everything, we outtie
                  //pause();
@@ -429,28 +534,31 @@ int ReadBuffer(int rv,char inputBuf[]) {
                 //TODO: add tab functionatlity
                 break;
               case isArrow1:
-                if(getchar() == isArrow2)
+                symbol = getchar();
+                if(symbol == isArrow2)
                 {
-                  switch(getchar()){
-                    case UP_ARROW:
-                      --cursor;
-                      printToScreen = false;
-                      break;
-                    case DOWN_ARROW:
-                      --cursor;
-                      printToScreen = false;
-                      break;
-                    case RIGHT_ARROW:
-                      --cursor;
-                      printToScreen = false;
-                      break;
-                    case LEFT_ARROW:
-                      --cursor;
-                      printToScreen = false;
-                      break; 
+                  symbol = getchar();
+                    if(symbol == UP_ARROW || symbol == DOWN_ARROW)
+                    {
+                      if( (strFromHist = displayHistory(symbol) ) != NULL )
+                        { 
+                          eraseLine();
+                          strcpy(inputBuf,strFromHist);
+                          output("\r\033[K%s%s",pathVal, inputBuf);
+                          cursor = inputBuf;
+                          count = strlen(inputBuf);
+                          cursor+=count;
+                        }
+                        --cursor;
+                        printToScreen = false;
                     }
-                    
+                    else if(symbol == RIGHT_ARROW || symbol == LEFT_ARROW)
+                    {
+                      --cursor;
+                      printToScreen = false;
+                    }
                 }
+                break;
             }
           
           if(printToScreen){
@@ -522,11 +630,11 @@ char * getValueFromKey(const char * key){
 
 
 void setVariable(const char* key, char* newValue){
-    debug("Current -> %s variable :::: %s\n", key, getenv(key));
+    //debug("Current -> %s variable :::: %s\n", key, getenv(key));
     unsetenv(key);
-    debug("After unset -> %s variable :::: %s\n", key, getenv(key));
+    //debug("After unset -> %s variable :::: %s\n", key, getenv(key));
     setenv(key, newValue, 1);
-    debug("After set env ->  %s variable :::: %s\n", key, getenv(key));
+    //debug("After set env ->  %s variable :::: %s\n", key, getenv(key));
 }
 
 
@@ -540,15 +648,18 @@ char* getProgramFromPath(cmdP command){
     //debug("Entering Program");
     bool isFound = false;
     char* value = getValueFromKey(PATH_VAR);
-
     char* path = (char*) malloc(sizeof(char) * strlen(value) + 1);
     strcpy(path, value);
 
     const char* original = path;
 
-    path = strtok(path,PATH_DELIM);
 
-    if(path !=NULL){
+    path = strtok(path,PATH_DELIM);
+    if(strstr(command->program,"/") != NULL && checkIfPathExists(command->program))
+    {
+      isFound = true;
+    }
+    else if(path !=NULL){
         while(path != NULL){
 
  //         debug("Checking Path : %s\n", path);
@@ -711,7 +822,7 @@ void cd(cmdP exec){
 
 }
 
-char* replaceHome(char** oldPath){
+char* replaceHome(char** oldPath){//TODO : Implememnt replacing home with ~
     char* home = getValueFromKey(HOME_VAR);
     home = "";
     oldPath++;
@@ -727,7 +838,7 @@ void replaceVariables(cmdP exe){
 
     char* needle;
     while(*argv != NULL){
-      debug("Checking Value %s\n",  *argv);
+      //debug("Checking Value %s\n",  *argv);
       if((needle = strstr(*argv,"$")) == *argv){ //If the $ is at the start
           *argv = getValueFromKey(needle + 1); //Replace the pointer to this argument with the variable value
           debug("Replaced %s with %s", needle, *argv);
@@ -799,23 +910,26 @@ void writeHistory(cmdP exec){
     strcat(file, home);
     strcat(file, "/");
     strcat(file, history_fileName);
-
-    int history_fd;
-    if((history_fd = Open(file, O_CREAT | O_WRONLY| O_APPEND, (S_IWUSR| S_IRUSR | S_IXUSR)) < 0)){
+    /* file should not be created here it should be created when the program is fun runned*/
+    int history_fd = Open(history_fileName, O_CREAT| O_WRONLY | O_APPEND, (S_IWUSR| S_IRUSR | S_IXUSR));
+    if((history_fd < 0)){
       return;
     }
 
-    
+    histListP historyList = (histListP) calloc(1, sizeof(HistoryList));
+    //creates a new string array to hold the value to be copied over to the struct
     size_t length;
-    while(*(argv) != NULL){
-      length = strlen(*argv);
-      Write(history_fd, *argv, length);
-      Write(history_fd, " ", 1);
 
-      argv++;
-    }
-    Write(history_fd, "\n", 1);
+      length = strlen(exec->originalStr);
+      Write(history_fd, exec->originalStr, length);
+      Write(history_fd, "\n", 1);
+    size_t len = strlen(exec->originalStr)+1;
+    debug("The length of the newString is %zu \n",len);
+    char *newString = malloc(len);
+    strncpy(newString,exec->originalStr,len);
 
+    //grabs the last item in the linkedList and appends the new item and makes it the new tail;
+    addHistoryNode(historyList,newString);
     Close(history_fd);
 }
 
@@ -830,7 +944,7 @@ void History(){
     strcat(file, history_fileName);
 
 
-    int history_fd = OpenIgnoreMode(file, O_RDONLY);
+    int history_fd = OpenIgnoreMode(history_fileName, O_RDONLY);
     if(history_fd < 0) return;
 
     output("--------History Dump---------\n");
@@ -855,57 +969,297 @@ void clearHistory(){
     strcat(file, "/");
     strcat(file, history_fileName);
 
+    freeHistory();
 
-    int history_fd = OpenIgnoreMode(file, O_TRUNC | O_WRONLY);
+    int history_fd = OpenIgnoreMode(history_fileName, O_TRUNC | O_WRONLY);
     Close(history_fd);
 }
 
+void readHistory(){
+  // returns true if successful f if failure
+  /*puts all the history into a string array for iteration*/ 
+  int history_fd = Open(history_fileName, O_CREAT| O_RDONLY | O_APPEND, (S_IWUSR| S_IRUSR | S_IXUSR));
+  int bytesRead;
+  int count = 0;
+  char *delim = "\n";
+  char *buffer;
+  //replace new line with null terminator
+  // histListP historyList = (histListP) calloc(1, sizeof(HistoryList));
+  // addHistoryNode(historyList);
+  // histListP currentHistory = historyHead;
+  //lseek
+  histListP historyList;
+  while( ( count = getLineCount(history_fd) ) > 0)// this will read and then move the cursor back
+  {
+    if(count == -1) break;
+    Lseek(history_fd, (~count) + 1, SEEK_CUR);
+    buffer = malloc(count);
+    bytesRead = Read(history_fd, buffer, count);
+    buffer = strtok(buffer, delim);//replace the newline character with a null terminator
+    //(currentHistory->string)=buffer;
 
+    histListP historyList = (histListP) calloc( 1, sizeof(HistoryList));
+
+
+    addHistoryNode(historyList, buffer);
+   // addHistoryNode(historyList);
+
+    // historyList->prev=currentHistory;
+    // currentHistory->next = historyList;
+
+   // currentHistory= currentHistory->next;
+
+    //update head and tail
+    // historyHead->prev=currentHistory;
+    // currentHistory->next=historyHead;
+
+  }
+  //for the last node that is blank
+  // historyHead->prev = currentHistory->prev;
+  // currentHistory->prev->next = historyHead;
+  // currentHistory->next= NULL;
+
+  // free(currentHistory->string);
+  // free(currentHistory);
+  Close(history_fd);
+}
+void addHistoryNode(histListP historyList, char *buffer)
+{
+    historyList->string = buffer;
+
+    if(historyHead == NULL){ //None have been added
+        historyHead = historyList;
+        historyHead-> next = historyHead->prev = historyHead;
+    }
+    else if(historyHead->prev == historyHead){ //There's only one
+        historyList-> next = historyList-> prev = historyHead;
+        historyHead->next = historyHead->prev = historyList;
+    }
+    else{ //At least 2
+        histListP oldTail = historyHead->prev; //Temporarily store the old tail
+        oldTail-> next = historyList;
+        historyList-> prev = oldTail; 
+        historyList-> next = historyHead;
+        historyHead-> prev = historyList;
+    }
+    lastKnownhistListPSpot = historyList->prev;
+
+}
+void freeHistory()
+{
+  histListP cursor;
+
+  while( (cursor = popHistoryNode(historyHead)) != NULL)
+  {
+    free(cursor->string);
+    free(cursor);
+  }
+  // historyHead = NULL;removeHistoryNode itself should make it NULL
+}
+
+histListP popHistoryNode(histListP node)
+{
+      histListP returnHistory = NULL,start;
+      if((start = historyHead) == NULL) return NULL;
+
+    do
+    {
+      if(start == node)
+      {
+        returnHistory = start;
+
+        if(start -> next == start) //There's only one
+        {
+            if(start == historyHead)
+            {
+              debug("Deleting Head %s\n",start->string);
+              historyHead = NULL;
+            }
+            else
+            {
+              debug("Something got messed up\n");
+            }
+        }
+        else //2 or more
+        {
+          debug("Deleting Node %s\n",start->string);
+          histListP nextOne = returnHistory->next;
+          returnHistory->prev->next = nextOne;
+          nextOne->prev = returnHistory->prev;
+          returnHistory-> next = returnHistory-> prev = NULL;
+
+          historyHead = nextOne;
+        }
+        
+        break;
+      }
+      start = start-> next;
+    }while(returnHistory != historyHead);
+
+    debug("Returning Node\n");
+    // printProcess(returnProcess);
+    return returnHistory;
+
+}
+char *displayHistory(char sym)
+{
+  if(historyHead ==  NULL)
+    return NULL;
+  if(lastKnownhistListPSpot == NULL)
+    lastKnownhistListPSpot = historyHead;
+
+  if(UP_ARROW == sym)
+    lastKnownhistListPSpot = lastKnownhistListPSpot->next;
+  else if(DOWN_ARROW == sym)
+    lastKnownhistListPSpot = lastKnownhistListPSpot->prev;
+  else
+  {
+    debug("This shouldnt happen");
+  }
+  return (lastKnownhistListPSpot->string);
+
+
+}
+int getLineCount(int fd){
+  int bytesRead;
+  int ctr = 0;
+  char *buffer = malloc(sizeof(char));
+  while( (bytesRead = Read(fd, buffer, BYTE)) > 0)
+  {
+    ctr++;
+    if(*buffer == NEWLINE)
+      {   
+        if(ctr == 1)
+        {
+          free(buffer);
+          return -1;
+        }
+        break;
+     }
+        
+
+  }
+  free(buffer);
+  return ctr;
+}
+
+
+/****************** Threading ******************************/
 void setForeground(cmdP exe){
     procP newProcess;
+    //sigset_t mask, prev;
+
+    //synchronizeFull(&mask, &prev);
+    procP oldProc = foregroundProcess;
+
     if((newProcess = findProcess(exe->tacks[1]))){ //Not null
-        foregroundProcess->isInForeground = false;
-        newProcess->isInForeground = true;
+        if(foregroundProcess){
+          foregroundProcess->command->isInfinite = false;  //Put in BG
+          foregroundProcess->lastKnownStatus = 0;         // Set it to run status
+        }
+
         foregroundProcess = newProcess;
+        newProcess->command->isInfinite=true;
+        newProcess->lastKnownStatus=0;
+      //endSynchronize(&prev);
     }
-    
+    else {
+      if(foregroundProcess){
+        foregroundProcess->lastKnownStatus = 0; //Run it again
+        printProcess(foregroundProcess);
+        multiThreadDebug("Signaling child : %d --> \n", foregroundProcess->pId);
+      }
+      
+      //endSynchronize(&prev);
+    }
+    if(oldProc) signalGroupPid(oldProc->pId,SIG_CONT);
+    if(newProcess) signalGroupPid(newProcess->pId,SIG_CONT);
+    printProcess(foregroundProcess);
 }
 
-void setBackground(cmdP exe){
-    foregroundProcess->isInForeground = false;
+void setBackground(){
+   // sigset_t mask, prev;
+
+    procP oldProc = foregroundProcess;
+    //synchronize_single(&mask, prev, SIG_);
+    
+    foregroundProcess->command->isInfinite = true;
+    foregroundProcess->lastKnownStatus=0;
+    
+    printProcess(foregroundProcess);
     foregroundProcess = NULL;
-    exe= NULL;
+    
+    //endSynchronize(&prev);
+
+    if(oldProc)signalGroupPid(oldProc->pId,SIG_CONT);
 }
+
 
 procP findProcess(char* argument){
-  bool isJob = false;
+    bool isJob = false;
     char* thread = argument;
-    if(! thread) procError("Can't Set foreground process without ID\n");
+    multiThreadDebug("Starting the find process...\n");
 
-    if(! (strstr(thread,"%"))){ //If there's a % then it's a Job ID
+    if(! thread) {
+      procError("Can't Set foreground process without ID\n");
+      return NULL;
+    }
+
+
+    if((thread = strstr(thread,"%"))){ //If there's a % then it's a Job ID
         ++thread; // Skip the %
         isJob = true;
     }
+
+    multiThreadDebug("Is it a job ID ? : %d\n", isJob);
 
     int length =strlen(thread);
     int id = 0;
     for(int i = 0; i< length;i++){
       if(thread[i] < '0' || thread[i] > '9') return NULL; //Can't accept non digits 
-      id += id * 10 + thread[i] - '0'; 
+      id += id * 10 + (thread[i] - '0'); 
     }
 
-    procP returnValue = NULL;
-   /* if(isJob) returnValue = *(processes + id);
-    else{
-        procP * procs = processes; //List of pointers
-        while(*procs){ //Not Null
-            if(id == (*procs)->pId) {
-              returnValue = *(processes + (*procs)->jobId);
+    multiThreadDebug("Found Job ID :  %d\n", id);
+
+      procP returnValue = NULL;
+      procP start = headProcess;
+      multiThreadDebug("JOB ID : %016x\n", (int)start);
+      do
+      {
+        if(isJob){ //Use Job ID
+            if(id == start->jobId){
+              returnValue = start;
+              break;
             }
         }
-    }*/
+        else{ //Else use Process ID
+            if(id == start->pId){
+                returnValue = start;
+                break;
+            }
+        }
+        
+        start = start->next;
+      }while(start != headProcess);
 
     return returnValue;
+}
+
+
+lambda_t* SignalFunc(int signalNum, lambda_t* handler){
+  
+  struct sigaction action, old_action;
+
+  action.sa_handler = handler;
+  sigemptyset(&action.sa_mask); /* Block sigs of type being handled */
+  action.sa_flags = SA_NODEFER;
+
+  if(sigaction(signalNum, &action, &old_action) < 0){
+      multiThreadDebug("Error signaling\n");
+  }
+
+  return (old_action.sa_handler);
 }
 
 void killProcess(){
@@ -916,13 +1270,22 @@ void killProcess(){
 
 void printJobs(){
 
-  procP start = head;
+  procP start = headProcess;
+
+  if(! start) return;
+
   do{
-    printProcess(start);
+
+    //if(start->command->isInfinite) 
+        printProcess(start);
+       
     start = start->next;
-  }while(start && start != head); //While there are more processes
+  }while(start && start != headProcess); //While there are more processes
     
 }
+
+/****************** END Threading ****************************/
+
 
 
 /***************************SHELL BUILT-IN FUNCTIONS END*******************************/
@@ -935,24 +1298,33 @@ void printJobs(){
 /**************************** WRAPPER CLASSES *****************************************/
 
 int OpenFileCurrentDirIgnoreMode(const char *file, int flags){
-    char buffer[MAX_PATH];
-    char * current = getcwd(buffer,MAX_PATH);
-    strcat(current, "/");
-    strcat(current, file);
+    
+    char* current = (char*) file;
+    if(! strstr(file, "/")){
+        char buffer[MAX_PATH];
+        memset(buffer, 0, MAX_PATH);
+        char * current = getcwd(buffer,MAX_PATH);
+        strcat(current, "/");
+        strcat(current, file);
+    }
 
     return OpenIgnoreMode(current, flags);
 }
 
 int OpenFileCurrentDir(const char* file, int flags, mode_t mode){
-    char buffer[MAX_PATH];
-    char * current = getcwd(buffer,MAX_PATH);
-    strcat(current, "/");
-    strcat(current, file);
-
+     char* current = (char*) file;
+    if(! strstr(current, "/")){
+      char buffer[MAX_PATH];
+      memset(buffer, 0, MAX_PATH);
+      current = getcwd(buffer,MAX_PATH);
+      strcat(current, "/");
+      strcat(current, file);
+    }
     return Open(current, flags, mode);
 }
 
 int OpenIgnoreMode(const char *file, int flags){
+
   int returnVal;
   if((returnVal = open(file, flags)) < 0){
       error("Error Opening File : %s --> %s\n", file, strerror(errno));
@@ -962,6 +1334,7 @@ int OpenIgnoreMode(const char *file, int flags){
 }
 
 int Open(const char* file, int flags, mode_t mode){
+
   int returnVal;
   if((returnVal = open(file, flags, mode)) < 0){
       error("Error Opening File : %s --> %s\n", file, strerror(errno));
@@ -997,6 +1370,17 @@ int Close(int fd){
   return returnVal;
 }
 
+void CloseAll(int in_fd, int out_fd, int backFile, int inputFile){
+    if(backFile != -1)
+      Close(backFile);
+    if(inputFile != -1)
+      Close(inputFile);
+    if(in_fd != -1)
+      Close(in_fd);
+    if(out_fd != -1)
+      Close(out_fd);
+}
+
 off_t Lseek(int fd, off_t offset, int whence){
 
     off_t totalOffset;
@@ -1018,8 +1402,41 @@ off_t Lseek(int fd, off_t offset, int whence){
 
 
 /***************************PARSING/EXECUTING************************************/
+trieP BuildTrie(char *directory)
+{
+  trieP root = (trieP)calloc(1, sizeof(Trie));
+  DIR *dir;
+  struct dirent *dp;
+  dir = opendir(directory);
+  int len;
+  int i;
+  trieP iterator = root;
+  while ((dp=readdir(dir)) != NULL) {
+        output("looking for string files %s\n", dp->d_name);
+        len = strlen(dp->d_name);//length of string to spinoff
+        for(i = 0; i < len;i++)
+        {
+          int pos = (int)dp->d_name[i];
+          if( (iterator->children[pos]) == NULL) // we have to hash it the new child
+          {
+            trieP newChild = (trieP)calloc(1, sizeof(Trie));
+            newChild->sym = dp->d_name[i];
+            iterator->children[pos] = newChild;
+            (iterator->amountOfChildren)++;
+          }
+          // child exist in the heap so we got to make it real
+          iterator = iterator->children[pos];
 
+        }
 
+        iterator = root;
+      }
+
+    //build 
+    closedir(dir);
+
+    return root;
+}
 
 bool glob(const cmdP exe){
 
@@ -1050,7 +1467,6 @@ bool glob(const cmdP exe){
     char buffer[MAX_PATH];
     char *current_working_dir = getcwd(buffer,MAX_PATH);
 
-   
     dir = opendir(current_working_dir);
 
     while ((dp=readdir(dir)) != NULL) {
@@ -1062,7 +1478,7 @@ bool glob(const cmdP exe){
 
     dir = opendir(current_working_dir);
 
-    char** matches = malloc((matchCounter + preGlobCounter) * sizeof(char * )); // Add 1 to match counter for program
+    char** matches = calloc(1, (matchCounter + preGlobCounter) * sizeof(char * )); // Add 1 to match counter for program
     char** original = matches;
     argv = exe->tacks;
 
@@ -1076,7 +1492,7 @@ bool glob(const cmdP exe){
         debug("Found file : %s\n", dp->d_name);
 
         if((strstr(dp->d_name,needle))){
-            str = malloc(strlen(dp->d_name));
+            str = calloc(1, strlen(dp->d_name));
             *(matches++) = strcpy(str,dp->d_name);
         }
 
@@ -1091,37 +1507,88 @@ bool glob(const cmdP exe){
 
 pid_t forkProcess(){
   pid_t returnVal;
+  //multiThreadDebug("Forking!\n");
+
   if((returnVal = fork()) < 0){
-    error("Error trying to fork a process : %s", strerror(errno));
+    error("Error trying to fork a process : %s\n", strerror(errno));
     exit(EXIT_FORKFAIL);
+  }
+  else{
+    //multiThreadDebug("Forked Successfully!\n");
   }
 
   return returnVal;
 }
 
 
+void createBackgroundProcess(){
 
 
+  pid_t pid;
+  sigset_t mask, prev;
+
+  //sigaddset(&mask, SIG_INT);
+
+  
+  SignalFunc(SIG_INT,signal_interrupt);
+  SignalFunc(SIG_TSTP,signal_pause);
+  SignalFunc(SIG_CONT,signal_continue);
+  SignalFunc(SIG_CHLD,sig_child);
+  sigemptyset(&mask);
+  synchronizeFull(&mask, &prev);
+  
+  setpgid(0,0);
+
+  if((pid = forkProcess())){
+    endSynchronize(&prev);
+    volatile sig_atomic_t signaled = 0;
+    pause_signal = stop_signal = 0;
+    //multiThreadDebug("In parent process!\n");
+    while(!stop_signal){
+      sigsuspend(&prev);
+      signaled = 0;
+      while(pause_signal){
+        signaled = 1;
+        //signalGroup(SIG_TSTP);
+        multiThreadDebug("Pausing!\n");
+        sigsuspend(&prev);
+      }
+      /*if(signaled){
+        multiThreadDebug("Continuing!\n");;
+        signalGroup(SIG_CONT);
+        signaled = 0;
+      }
+      */
+
+    }  
+
+    //multiThreadDebug("Yayy returned successfully!\n"); 
+    //multiThreadDebug("Grandparent Signaling all children : \n");   
+    signalGroup(SIG_INT);
+    //multiThreadDebug("DONE : Grandparent Signaled children \n" );
+    //endSynchronize(&prev);
+    exit(EXIT_OK);
+  }
+  endSynchronize(&prev);
+
+}
+
+
+/*Check if command is a builtin command*/
+/* Have a list of functions we support 
+* this method will check the list to see if program name is supported
+*
+*/
 int isTypeBuiltin(cmdP exe)
 {
-  /*Check if command is a builtin command*/
-  /* Have a list of functions we support 
-  * this method will check the list to see if program name is supported
-  *
-   */
+    //multiThreadDebug("Checking if is built in! \n");
 
     for(int i = 0; i < Total_BuiltIns; i++)
     {
       if(!strcmp(exe->program,builtInMethods[i]))
       {
 
-            if(!strcmp(exe->program,"cd"))
-            { 
-        
-              debug("Executing cd\n");
-              cd(exe);
-            }
-            else if(!strcmp(exe->program,"pwd"))
+            if(!strcmp(exe->program,"pwd"))
             { 
               debug("Executing pwd\n");
               executePwd();
@@ -1131,146 +1598,239 @@ int isTypeBuiltin(cmdP exe)
               debug("Executing echo\n");
               echo(exe);
             }
-            else if(!strcmp(exe->program,"set"))
-            {
-              debug("Executing Set\n");
-              setVar(exe);
-            }
+            
             else if(!strcmp(exe->program,"history"))
             {
               debug("Executing History\n");
               History();
             }
-            else if(!strcmp(exe->program,"clear-history"))
-            {
-              debug("Executing Clear History\n");
-              clearHistory();
-            }
-            else if(!strcmp(exe->program,"jobs"))
-            {
-              debug("Executing Jobs\n");
-              printJobs();
-            }
-            else if(!strcmp(exe->program,"fg"))
-            {
-              debug("Executing FG\n");
-              setForeground(exe);
-            }
-            else if(!strcmp(exe->program,"bg"))
-            {
-              debug("Executing BG\n");
-              setBackground(exe);
-            }
-            else if(!strcmp(exe->program,"kill"))
-            {
-              debug("Executing Killl\n");
-              killProcess();
-            }
+            
             else
-              debug("This should never happen\n");
-           exit(EXIT_OK);     
+              debug("This should never happen\n"); 
+               
            return 0;     
         }
     }
   return -1;
 }
 
+int isSoloBuiltin(cmdP exe){
 
+  //multiThreadDebug("Running Solo builtins now!\n");
 
+  sigset_t mask,prev;
+  int returnValue = (foregroundProcess!= NULL)? 0 : -1; //If fg process: return 0 so we don't fork process
+  for(int i = 0; i < Total_solo_builtin; i++)
+  {
+    if(!strcmp(exe->program,soloBuiltInMethods[i]))
+    {
 
-void launchExecutable(cmdP exe){
-    /*In this section of code I'm going to be taking my exe and checking
-    * if it is not a child process then checking using the execve if the program is in
-    * built in or not if it for now i only care if it isn't
-    */
-    bool isFirstProgram = true;
-    //TODO delete these modifications to the struct
-
-    cmdP head = exe;
-    int inputFile = -1;//TODO change name later
-    int backEndFile;//TODO change
-
-    while(exe != NULL)
-    { 
-       // This line will open a new file if it is new otherwise set it to -1 
-      backEndFile = (exe->next != NULL) ? Open(OUTERFILE, O_CREAT | O_RDWR | O_TRUNC, (S_IWUSR| S_IRUSR | S_IXUSR)) : -1;
-
-      //TODO put these error checking files into their own file
-      if(!areCommandsInValidFormat(exe,isFirstProgram))
-        return;
-
-      if(!strcmp(exe->program,"exit"))
-        exit(EXIT_OK);
-
-
-
-      int exitCode;
-      procDebug("RUNNING: %s\n", exe->program); 
-      int wpid;
-      int process;
-
-      if((process = forkProcess()) == 0) /* This means it is a child process and i should laundh some stuff*/
-      {
-        
-
-        int input = (inputFile == -1) ? exe->in_fd : inputFile;
-        int output = (backEndFile == -1) ? exe->out_fd : backEndFile; 
-        switchSTDFileDescriptors(input,output);
-        if((exitCode = isTypeBuiltin(exe)) == -1)
+        if(!strcmp(exe->program,"clear-history"))
         {
-           // debug("Execute non built-in program\n");
-           exitCode = executeExternalProgram(exe);
+          debug("Executing Clear History\n");
+
+          
+          if(foregroundProcess== NULL)  clearHistory();
+          
         }
+        else if(!strcmp(exe->program,"cd"))
+        {
+          debug("Executing Clear History\n");
+          if(foregroundProcess== NULL)  cd(exe);
+        }
+        else if(!strcmp(exe->program,"jobs"))
+        {
+          debug("Executing Jobs\n");
+          printJobs();
+        }
+        else if(!strcmp(exe->program,"fg"))
+        {
+          debug("Executing FG\n");
+          setForeground(exe);
+        }
+        else if(!strcmp(exe->program,"set"))
+        {
+          debug("Executing Set\n");
+          if(foregroundProcess== NULL)  setVar(exe);
+        }
+        else if(!strcmp(exe->program,"bg"))
+        {
+          debug("Executing BG\n");
+          setBackground();
+        }
+        else if(!strcmp(exe->program,"kill"))
+        {
+          debug("Executing Killl\n");
+          killProcess();
+        }else if(!strcmp(exe->program,"exit"))
+        {
+          debug("Executing Killl\n");
+          if(foregroundProcess== NULL) exit(EXIT_OK);
+        }
+        else{
+          debug("Hmm\n");
+        }
+        //multiThreadDebug("Returning success from solo!\n");
+        returnValue = 0;
       }
-      else
-      {
-         waitpid(process,&wpid,0);/*Having a 0 as input forces the main thread to wait for all child processes to finish before reexecuting*/
-        // int exitCode = WIFEXITED(&wpid);
-        // if(WIFEXITED(&wpid))
-          // exitCode = WEXITSTATUS(&wpid);
-        if(exe->in_fd != -1)
-          Close(exe->in_fd);
-        if(exe->out_fd != -1)
-          Close(exe->out_fd);
-      }
-      if((exe = exe->next) != NULL)
-      {
-        /// TODO make sure to edit close method to allow acceptance of multiple arguments
-        if(inputFile != -1)
-          Close(inputFile);
-        if(backEndFile != -1)
-          Close(backEndFile);//CLoses old file
-        inputFile = copyFiletoNewFile();
-      }
-      isFirstProgram = false;
-      procDebug("ENDED: %s (ret=%d)\n", exe->program,exitCode);
+
   }
-  if(backEndFile != -1)
-    Close(backEndFile);
-  if(inputFile != -1)
-      Close(inputFile);
-  exe = head;
+  //multiThreadDebug("Returning failure from solo!\n");
+  return returnValue;
+}
+
+/*In this section of code I'm going to be taking my exe and checking
+* if it is not a child process then checking using the execve if the program is in
+* built in or not if it for now i only care if it isn't
+*/
+void launchExecutable(cmdP exe){
+    
+    cmdP head = exe;
+    bool isFirstProgram = true; 
+    int inputPipeFile = -1, backEndFile = -1;
+    int wpid,exitCode = 0, exitStatus = 0;
+    pid_t process;
+    procP newForeground = NULL;
+
+
+        SignalFunc(SIG_CHLD,sig_child_main);
+        SignalFunc(SIG_USR1,sig_child_run);
+
+        if((exitCode = isSoloBuiltin(exe)) == 0){
+            //multiThreadDebug("Is a solo builtin!\n");
+        }
+        else if((process = forkProcess()) == 0) /* This means it is a child process and i should launch some stuff*/
+        {
+          //multiThreadDebug("Running program now!\n");
+          sigset_t mask,prev;
+          exitCode = 0;
+          SignalFunc(SIG_CHLD,sig_child);
+          SignalFunc(SIGXCPU,SIG_IGN);
+          synchronizeFull(&mask, &prev);
+          endSynchronize(&prev);
+
+          while(! parent_done_signal)
+            sigsuspend(&prev);
+
+          //multiThreadDebug("Done Yielding\n");
+          createBackgroundProcess(); //Launch another fork, only child returns
+          
+          pid_t new_process;
+          while(head != NULL){
+          
+              //multiThreadDebug("Looping! head = %s\n", head->program);
+              
+ 
+              //multiThreadDebug("Forking another child now!\n");
+              if(!(new_process = forkProcess())){//For child
+                      // This line will open a new file if it is new otherwise set it to -1 
+                      backEndFile = (head->next != NULL) ? 
+                          Open(OUTERFILE, O_CREAT | O_RDWR | O_TRUNC, (S_IWUSR| S_IRUSR | S_IXUSR)) : -1;
+
+                      if(!areCommandsInValidFormat(exe,isFirstProgram)) {
+                          multiThreadDebug("Not in valid format!\n");
+                          exit(EXIT_FAILURE);
+                      }
+
+                      int input = (inputPipeFile == -1) ? head->in_fd : inputPipeFile;
+                      int output = (backEndFile == -1) ? head->out_fd : backEndFile; 
+                      switchSTDFileDescriptors(input,output);
+
+
+                      procDebug("RUNNING: %s\n", head->program); 
+              
+                      //multiThreadDebug("Running program now!\n");
+                      if((exitCode = isTypeBuiltin(head)) == -1)
+                      {
+                        //debug("Execute non built-in program\n");
+                        exitCode = executeExternalProgram(head);
+                      }
+
+                      
+                      procDebug("ENDED: %s (ret=%d)\n", head->program,exitCode);
+                      
+                      //multiThreadDebug("Child Dying with exit code %d!\n", exitCode);
+                      exit(exitCode);
+              }
+              else{
+                  while(! child_done_signal){
+                    sigsuspend(&prev);//waitpid(-1,&wpid,0);/*Having a 0 as input forces the main thread to wait for all child processes to finish before reexecuting*/
+                  }
+
+                  multiThreadDebug("Parent Done waiting! Goodbye!\n");
+                   //exitCode = WIFEXITED(&wpid);
+                  if(WIFEXITED(&wpid))
+                      exitCode = WEXITSTATUS(&wpid);
+                  //multiThreadDebug("Child Died with exit code %d, Error : %s!\n", exitCode, strerror(errno));
+                  isFirstProgram = false;
+                  exitStatus = exitStatus | exitCode;
+                  if(exitStatus) {
+                    //multiThreadDebug("Parent Dying from failure! \n");
+                    exit(EXIT_FAIL);
+                  }
+              }
+
+
+              CloseAll(head->in_fd, head->out_fd, backEndFile, inputPipeFile);
+
+              if((head = head->next) != NULL)
+              {
+                //debug("Moving to next position !\n");
+                inputPipeFile = copyFiletoNewFile();
+              }
+
+            }//END WHILE LOOP
+
+            //multiThreadDebug("Parent Dying! --> \n");
+            signalGroup(SIG_INT);
+            //multiThreadDebug("DONE : Parent Signaled child --> Dying \n");
+            exit(exitStatus);
+        }
+        else
+        {
+              
+            //Convert int to String
+              // int counter = 0;
+              // for(int temp = exitCode; temp > 0; temp = temp/10) counter++;
+              // char buffer[counter + 1];
+              // sprintf(buffer, "%d",exitCode);
+              // ///////////////////////
+              // setVariable("?", buffer);
+            
+              multiThreadDebug("Parent setting processID to : %d\n", process);
+              
+              newForeground = (procP) calloc(1, sizeof(Process)); 
+              newForeground->jobId = ++currentJobId;
+              newForeground->command = exe;
+              newForeground->pId = process;
+              newForeground->lastKnownStatus = 0; //Set status to running
+              addProcessNode(newForeground);
+
+              if(!exe->isInfinite && foregroundProcess == NULL){
+                  foregroundProcess = newForeground;
+              }
+              
+              signalChild(process,SIG_USR1); //Child can go now
+
+        }
+
 }
 
 
 int executeExternalProgram(cmdP exe){
 
-        /*Should probably use stat to check if the file exist*/
-           // char *args[] = {"ls", "",NULL}; 
-           /*Figure out how to take into consideration they providing their own directory*/
-           char * programPath = getProgramFromPath(exe);
+       char * programPath = getProgramFromPath(exe);
 
-           if(programPath == NULL || execvp(programPath,exe->tacks) == -1)
-           { 
-              procError("%s : Command Not found\n", exe->program);
-              exit(EXIT_FAIL);
-           }
-           else{
-              debug("Starting program %s with program path %s\n", programPath, exe->program);
-           }
-
-           //debug("You should do this smoothly\n");
-           exit(EXIT_OK);
+       if(programPath == NULL || execv(programPath, exe->tacks) == -1)
+       { 
+          procError("%s : Command Not found\n", exe->program);
+          exit(EXIT_FAIL);
+       }
+       else{
+          debug("Starting program %s with program path %s\n", programPath, exe->program);
+       }
+       
+       exit(EXIT_OK);
     }
 
 bool areCommandsInValidFormat(cmdP exe,bool isFirstProgram)
@@ -1281,16 +1841,18 @@ bool areCommandsInValidFormat(cmdP exe,bool isFirstProgram)
         procError("%s : Command Not found\n", exe->program);
         isValid = false;
       }
-      if( (isFirstProgram && exe->out_fd != -1 && exe->next != NULL) 
-          || (!isFirstProgram && exe->next == NULL && exe->in_fd != -1 ) 
-          || (!isFirstProgram && exe->next != NULL && exe->out_fd != -1 && exe->in_fd != -1 ) )
+      if( (isFirstProgram && exe->out_fd != -1 && exe->next != NULL && strcmp(exe->program,"cd") != 0) 
+          || (!isFirstProgram && exe->next == NULL && exe->in_fd != -1 && strcmp(exe->program,"cd") != 0) 
+          || (!isFirstProgram && exe->next != NULL && exe->out_fd != -1 && exe->in_fd != -1 && strcmp(exe->program,"cd") != 0) )
       { 
          procError("can't continue execution, format is incorrect\n");
          isValid = false;
       }
+      //multiThreadDebug("Returning exit code : %d for program %s!\n", isValid, exe-> program);
       return isValid;
 }
 void switchSTDFileDescriptors(int in_fd,int out_fd){
+
   if(in_fd !=  -1)
     dup2(in_fd,STDIN_FILENO);
   if(out_fd != -1)
@@ -1313,8 +1875,9 @@ int copyFiletoNewFile(){
 }
 
 bool checkIfProgramExists(char* path, cmdP command){
-    char *programPath = malloc(strlen(path) + strlen(command->program) + 2);
+    //char *programPath = malloc(strlen(path) + strlen(command->program) + 2);
 
+    char programPath[strlen(path) + strlen(command->program) + 2];
     strcat(programPath, path);
     strcat(programPath,"/");
     strcat(programPath, command->program);
@@ -1325,19 +1888,23 @@ bool checkIfProgramExists(char* path, cmdP command){
     if(isContained){
       strcpy(command->program, programPath);
     }
-    
-    free(programPath);
+    //free(programPath);
 
     return isContained;
 }
 
 bool checkIfPathExists(char* path){
-  struct stat *inbuf = malloc(sizeof(struct stat)); 
-  memset(inbuf, 0, sizeof(struct stat));
-  int input_stat = stat(path, inbuf);
+  sigset_t mask, prev;
+  
+  //  debug("init stat buffer\n");
+    struct stat status[sizeof(struct stat)];// *inbuf = (struct stat *) malloc(sizeof(struct stat)); 
+    //debug("after stat init\n");
+    memset(status, 0, sizeof(struct stat));
+    int input_stat = stat(path, status);
 
-  bool isContained = input_stat >= 0 ? true : false;
-  free(inbuf);
+    bool isContained = input_stat >= 0 ? true : false;
+    //free(inbuf);
+
   ///debug("Does Path Exist --> %d\n", isContained);
   return isContained;
 }
@@ -1354,6 +1921,66 @@ int distinctCount(char* haystack, char* needle){
   }
   return count;
 }
+
+void addProcessNode(procP newProcess){
+    if(headProcess == NULL){ //None have been added
+        headProcess = newProcess;
+        headProcess-> next = headProcess->prev = headProcess;
+    }
+    else if(headProcess->prev == headProcess){ //There's only one
+        newProcess-> next = newProcess-> prev = headProcess;
+        headProcess->next = headProcess->prev = newProcess;
+    }
+    else{ //At least 2
+        procP oldTail = headProcess->prev; //Temporarily store the old tail
+        oldTail-> next = newProcess;
+        newProcess-> prev = oldTail; 
+        newProcess-> next = headProcess;
+        headProcess-> prev = newProcess;
+    }
+    debug("Successfully added Node\n");
+    //printProcess(newProcess);
+}
+
+procP removeProcessNode(pid_t processID){
+      procP returnProcess = NULL,start;
+      if((start = headProcess) == NULL) return NULL;
+
+      multiThreadDebug("Removing process Nodes : %d\n",processID);
+    do
+    {
+      if(start->pId == processID){
+        returnProcess = start;
+
+        if(start -> next == start){ //There's only one
+          multiThreadDebug("Only one : %d\n",processID);
+            if(start == headProcess){
+                headProcess = NULL;
+            }
+            else{
+              debug("Something got messed up\n");
+            }
+        }
+        else{//2 or more
+          if(start == headProcess) headProcess = headProcess->next;
+          multiThreadDebug("2 or more : %d\n",processID);
+          procP nextOne = returnProcess->next;
+          returnProcess->prev->next = nextOne;
+          nextOne->prev = returnProcess->prev;
+          returnProcess-> next = returnProcess-> prev = NULL;
+        }
+        
+        break;
+      }
+
+      start = start-> next;
+    }while(start != headProcess);
+
+    debug("Returning Node\n");
+    //printProcess(returnProcess);
+    return returnProcess;
+}
+
 
 void printCommand(cmdP command){
   debug("Command -> %d\n", ((int)command->next));
@@ -1372,13 +1999,33 @@ void printCommand(cmdP command){
 }
 
 
+void printAllProcesses(){
+    procP start;
+    if((start = headProcess) == NULL) return;
+
+    debug("----------Print processes----------------\n");
+    do
+    {
+      printProcess(start);
+      output("|\n");
+      output("v\n");
+      start = start-> next;
+    }while(start != headProcess);
+
+    debug("-------------End Print processes----------------\n");
+}
 
 void printProcess(procP process){
-    output("[%d] (%d) %s\t",process->jobId, process->pId, process->lastKnownStatus);
-    char**argv = process->command->tacks;
-    for(int i=0; i < process->command->tackCount;i++){
-      output("%s ", argv[i]);
+    if(process == NULL) return;
+
+    output("[%d] (%d) %s\t",process->jobId, process->pId, STATUS[process->lastKnownStatus]);
+    //char**argv = process->command->tacks;
+    if(process->command != NULL){
+      //for(int i=0; i < process->command->tackCount;i++){
+      output("%s ", process->command->originalStr);
+      //}
     }
+    if(process->command->isInfinite) output(" &");
     output("\n");
 } 
 

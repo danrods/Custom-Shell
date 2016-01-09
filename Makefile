@@ -33,4 +33,4 @@ gdb:
 	gdb -tui $(BIN)
 
 launch:
-	.	./launcher.sh $(ShellFlags)
+	. ./launcher.sh $(ShellFlags)
